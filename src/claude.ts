@@ -3,6 +3,7 @@ import { createInterface } from "readline";
 import fs from "fs";
 import path from "path";
 import { UserState } from "./state";
+import { config } from "./config";
 
 const TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout
 
@@ -38,16 +39,13 @@ export async function sendMessage(
   recalledContext?: string | null,
   includeRestartContext?: boolean
 ): Promise<ClaudeResponse> {
-  const systemPromptParts = [
-    "🤖 Your name is Clawde. You are a Discord bot that wraps Claude Code CLI, giving your owner (Josh) remote access to Claude Code from anywhere via Discord DMs.",
-    "Josh is messaging you RIGHT NOW through Discord. You receive his messages, run them through the Claude Code CLI on his local Windows machine, and send responses back to Discord.",
-    "You have full Claude Code capabilities: file editing, bash commands, search, web access, etc. You can read and modify files on Josh's machine.",
-    "You can even modify your own source code (the remote-claude project) and Josh can /restart you to pick up changes.",
-    `Working directory: ${state.cwd}`,
-    "Keep responses concise — Discord has a 2000 char per message limit and long responses get split across multiple messages.",
-    "Use markdown and code blocks for formatting. Avoid unnecessary verbosity.",
-    "Users can attach files (images, PDFs, code, etc.) which get downloaded to a temp directory — use the Read tool to view them when paths are provided.",
-  ];
+  // Build system prompt from config template with placeholder replacement
+  const basePrompt = config.systemPrompt
+    .replace(/\{botName\}/g, config.botName)
+    .replace(/\{ownerName\}/g, config.ownerName)
+    .replace(/\{cwd\}/g, state.cwd);
+
+  const systemPromptParts = [basePrompt];
 
   if (includeRestartContext) {
     systemPromptParts.push(

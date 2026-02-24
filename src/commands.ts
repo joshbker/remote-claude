@@ -374,7 +374,7 @@ export async function handleCommand(
         "`/restart` — Restart bot (picks up code changes)",
         "`/help` — This message",
         "",
-        "-# Send any DM to chat • Attach images for vision • Clawde has full Claude Code access",
+        `-# Send any DM to chat • Attach files for analysis • ${config.botName} has full Claude Code access`,
       ];
       await interaction.reply(helpText.join("\n"));
       break;

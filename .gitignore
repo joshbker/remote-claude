@@ -2,3 +2,5 @@ node_modules/
 dist/
 data/
 .env
+.temp-attachments/
+.temp-prompts/

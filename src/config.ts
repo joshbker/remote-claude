@@ -10,4 +10,7 @@ export const config = {
   defaultModel: process.env.DEFAULT_MODEL || "sonnet",
   defaultPermissionMode: process.env.DEFAULT_PERMISSION_MODE || "acceptEdits",
   statePath: path.join(__dirname, "..", "data", "state.json"),
+  botName: process.env.BOT_NAME || "Clawde",
+  ownerName: process.env.OWNER_NAME || "the user",
+  systemPrompt: process.env.SYSTEM_PROMPT || "",
 };

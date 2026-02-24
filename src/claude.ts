@@ -248,16 +248,26 @@ function handleMessage(
   }
 }
 
+function cleanFilePath(filePath: string): string {
+  // Strip temp-attachments path to just show filename for user-sent files
+  if (filePath.includes(".temp-attachments")) {
+    // Remove the timestamp prefix (e.g. "1771954123326-") and return just the filename
+    const basename = filePath.split(/[/\\]/).pop() || filePath;
+    return basename.replace(/^\d+-/, "");
+  }
+  return filePath;
+}
+
 function formatToolUse(toolName: string, input: any): string {
   const icon = getToolIcon(toolName);
 
   switch (toolName) {
     case "Read":
-      return `-# ${icon} Read ${input?.file_path || "unknown"}`;
+      return `-# ${icon} Read ${cleanFilePath(input?.file_path || "unknown")}`;
     case "Write":
-      return `-# ${icon} Created ${input?.file_path || "unknown"}`;
+      return `-# ${icon} Created ${cleanFilePath(input?.file_path || "unknown")}`;
     case "Edit":
-      return `-# ${icon} Edited ${input?.file_path || "unknown"}`;
+      return `-# ${icon} Edited ${cleanFilePath(input?.file_path || "unknown")}`;
     case "Bash": {
       const cmd = input?.command || "";
       const short = cmd.length > 80 ? cmd.slice(0, 80) + "..." : cmd;

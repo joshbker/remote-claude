@@ -6,7 +6,7 @@ import {
   InteractionType,
 } from "discord.js";
 import { config } from "./config";
-import { handleDirectMessage } from "./messageHandler";
+import { handleDirectMessage, injectStartupContext } from "./messageHandler";
 import { registerCommands, handleCommand } from "./commands";
 
 const client = new Client({
@@ -21,8 +21,16 @@ client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
   try {
     await registerCommands();
+
+    // Send startup notification to owner
+    const owner = await c.users.fetch(config.ownerId);
+    await owner.send("✅ Bot online and ready!");
+
+    // Inject startup context into Claude's session (without sending response to Discord)
+    const dmChannel = await owner.createDM();
+    await injectStartupContext(dmChannel);
   } catch (err) {
-    console.error("Failed to register commands:", err);
+    console.error("Failed to register commands or send startup DM:", err);
   }
 });
 

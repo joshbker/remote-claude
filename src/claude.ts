@@ -4,6 +4,19 @@ import { UserState } from "./state";
 
 const TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout
 
+// Track the active process so it can be killed externally
+let activeProc: ReturnType<typeof spawn> | null = null;
+
+export function cancelCurrentRequest(): boolean {
+  if (activeProc) {
+    console.log("[claude] Cancelling active request");
+    activeProc.kill();
+    activeProc = null;
+    return true;
+  }
+  return false;
+}
+
 export interface ClaudeResponse {
   text: string;
   toolUse: string[];
@@ -19,17 +32,34 @@ export interface StreamEvent {
 export async function sendMessage(
   prompt: string,
   state: UserState,
-  onStream?: (event: StreamEvent) => void
+  onStream?: (event: StreamEvent) => void,
+  recalledContext?: string | null,
+  includeRestartContext?: boolean
 ): Promise<ClaudeResponse> {
-  const systemPrompt = [
-    "🤖 OPERATIONAL CONTEXT: You are currently running as the Remote Claude Discord bot.",
+  const systemPromptParts = [
+    "🤖 You are currently running as the Remote Claude Discord bot.",
     "The user is messaging you RIGHT NOW through Discord DMs, and you are responding via the Claude Code CLI on their local machine.",
     "This conversation is happening through the bot architecture described in the codebase you have access to.",
     `Working directory: ${state.cwd}`,
     "You have full Claude Code capabilities: file editing, bash, search, web access, etc.",
     "Keep responses concise (Discord has a 2000 char per message limit, long responses get split).",
     "Use markdown and code blocks for formatting.",
-  ].join(" ");
+  ];
+
+  if (includeRestartContext) {
+    systemPromptParts.push(
+      "\n\n🔄 SYSTEM NOTICE: The Discord bot just restarted. This is a fresh session."
+    );
+  }
+
+  if (recalledContext) {
+    systemPromptParts.push(
+      "\n\n📜 RECALLED CONTEXT: The user used /recall to search their Discord message history.",
+      "Here are the relevant messages they wanted you to see:\n\n" + recalledContext
+    );
+  }
+
+  const systemPrompt = systemPromptParts.join(" ");
 
   const args = [
     "-p",
@@ -89,6 +119,7 @@ export async function sendMessage(
       env: cleanEnv,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    activeProc = proc;
 
     console.log(`[claude] PID: ${proc.pid}`);
 
@@ -124,6 +155,7 @@ export async function sendMessage(
     });
 
     proc.on("close", (code) => {
+      activeProc = null;
       console.log(`[claude] Exited code=${code}, text parts=${textParts.length}, tool parts=${toolUseParts.length}`);
       if (code !== 0 && textParts.length === 0) {
         error = error || stderr.trim() || `Claude exited with code ${code}`;
@@ -222,6 +254,18 @@ function formatToolUse(toolName: string, input: any): string {
       return `-# ${icon} Fetch: ${input?.url || ""}`;
     case "Task":
       return `-# ${icon} Agent: ${input?.description || ""}`;
+    case "TodoWrite": {
+      const todos = input?.todos || [];
+      const inProgress = todos.find((t: any) => t.status === "in_progress");
+      const completed = todos.filter((t: any) => t.status === "completed").length;
+      const pending = todos.filter((t: any) => t.status === "pending").length;
+      const total = todos.length;
+
+      if (inProgress) {
+        return `-# ${icon} ${inProgress.activeForm} (${completed}/${total} done, ${pending} pending)`;
+      }
+      return `-# ${icon} Updated todos: ${completed}/${total} done`;
+    }
     default:
       return `-# ${icon} ${toolName}`;
   }

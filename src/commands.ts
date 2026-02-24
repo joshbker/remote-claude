@@ -1,12 +1,17 @@
 import fs from "fs";
+import { spawn } from "child_process";
 import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
   REST,
   Routes,
+  Message,
+  DMChannel,
 } from "discord.js";
 import { config } from "./config";
 import { getState, updateState } from "./state";
+import { cancelCurrentRequest } from "./claude";
+import { setRecalledContext, clearRecalledContext } from "./messageHandler";
 
 const commands = [
   new SlashCommandBuilder()
@@ -66,6 +71,37 @@ const commands = [
           { name: "Bypass all", value: "bypassPermissions" }
         )
     ),
+
+  new SlashCommandBuilder()
+    .setName("restart")
+    .setDescription("Restart the bot (picks up code changes)"),
+
+  new SlashCommandBuilder()
+    .setName("remember")
+    .setDescription("Save a memory for Claude to remember across all sessions")
+    .addStringOption((opt) =>
+      opt
+        .setName("memory")
+        .setDescription("What to remember")
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("recall")
+    .setDescription("Search Discord message history and inject it into context")
+    .addStringOption((opt) =>
+      opt
+        .setName("query")
+        .setDescription("Search term to find in message history (optional - returns all if omitted)")
+        .setRequired(false)
+    )
+    .addIntegerOption((opt) =>
+      opt
+        .setName("limit")
+        .setDescription("Number of messages to search (default: 200)")
+        .setMinValue(10)
+        .setMaxValue(500)
+    ),
 ];
 
 export async function registerCommands(): Promise<void> {
@@ -118,6 +154,7 @@ export async function handleCommand(
 
     case "clear": {
       updateState({ hasActiveSession: false, sessionCostUsd: 0 });
+      clearRecalledContext();
       await interaction.reply("Conversation cleared. Next message starts fresh.");
       break;
     }
@@ -165,7 +202,159 @@ export async function handleCommand(
       break;
     }
 
+    case "restart": {
+      cancelCurrentRequest();
+      await interaction.reply("🔄 Restarting bot...");
+      // Give Discord time to send the reply, then exit.
+      // The wrapper (restart.ts) will auto-restart the process.
+      setTimeout(() => process.exit(0), 1000);
+      break;
+    }
+
+    case "remember": {
+      const memory = interaction.options.getString("memory", true);
+      await interaction.deferReply();
+
+      try {
+        // Run the claude CLI /remember command
+        const result = await runClaudeRemember(memory, state.cwd);
+        if (result.success) {
+          await interaction.editReply(`✅ Memory saved: "${memory}"`);
+        } else {
+          await interaction.editReply(`❌ Failed to save memory: ${result.error}`);
+        }
+      } catch (err: any) {
+        await interaction.editReply(`❌ Error: ${err.message}`);
+      }
+      break;
+    }
+
+    case "recall": {
+      // Defer immediately to avoid timeout
+      await interaction.deferReply();
+
+      try {
+        const query = interaction.options.getString("query");
+        const limit = interaction.options.getInteger("limit") || 200;
+        const channel = interaction.channel as DMChannel;
+
+        console.log(`[recall] Fetching ${limit} messages, query: ${query || "none"}`);
+        const context = await fetchMessageHistory(channel, query, limit);
+        console.log(`[recall] Got ${context.split('\n\n').length} results`);
+
+        if (context.length === 0) {
+          const searchMsg = query ? `matching "${query}"` : "in history";
+          await interaction.editReply(`🔍 No messages found ${searchMsg}`);
+          return;
+        }
+
+        // Store the context for the next message
+        setRecalledContext(context);
+
+        const searchMsg = query ? `matching "${query}"` : "from recent history";
+        await interaction.editReply(
+          `✅ Found ${context.split('\n\n').length} relevant message(s) ${searchMsg}\n` +
+          `Context is now active for this session. Use /clear to remove it.`
+        );
+      } catch (err: any) {
+        console.error("[recall] Error:", err);
+        await interaction.editReply(`❌ Error: ${err.message}`).catch(() => {});
+      }
+      break;
+    }
+
     default:
       await interaction.reply({ content: "Unknown command.", ephemeral: true });
   }
+}
+
+async function runClaudeRemember(
+  memory: string,
+  cwd: string
+): Promise<{ success: boolean; error?: string }> {
+  return new Promise((resolve) => {
+    const proc = spawn("claude", ["/remember", memory], {
+      cwd,
+      shell: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+
+    proc.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+
+    proc.on("error", (err) => {
+      resolve({ success: false, error: err.message });
+    });
+
+    proc.on("close", (code) => {
+      if (code === 0) {
+        resolve({ success: true });
+      } else {
+        resolve({ success: false, error: stderr.trim() || `Exit code ${code}` });
+      }
+    });
+  });
+}
+
+async function fetchMessageHistory(
+  channel: DMChannel,
+  query: string | null,
+  limit: number
+): Promise<string> {
+  // Discord API limits fetches to 100 messages at a time, so we need to paginate
+  const allMessages: Message[] = [];
+  let lastId: string | undefined = undefined;
+  const batchSize = 100;
+
+  while (allMessages.length < limit) {
+    const toFetch = Math.min(batchSize, limit - allMessages.length);
+    const options: any = { limit: toFetch };
+    if (lastId) {
+      options.before = lastId;
+    }
+
+    const batch = await channel.messages.fetch(options);
+    if (batch.size === 0) break; // No more messages
+
+    allMessages.push(...batch.values());
+    lastId = batch.last()?.id;
+
+    // If we got fewer than requested, we've hit the end
+    if (batch.size < toFetch) break;
+  }
+
+  // Filter messages that contain the query (case insensitive) if query provided
+  let relevant: Message[] = allMessages;
+
+  if (query) {
+    const queryLower = query.toLowerCase();
+    relevant = [];
+    for (const msg of allMessages) {
+      if (msg.content.toLowerCase().includes(queryLower)) {
+        relevant.push(msg);
+      }
+    }
+  }
+
+  // Sort by timestamp (oldest first)
+  relevant.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+  // Format as conversation pairs
+  const formatted: string[] = [];
+
+  for (const msg of relevant) {
+    const author = msg.author.bot ? "Assistant" : "User";
+    const timestamp = msg.createdAt.toISOString().split('T')[0]; // Just the date
+    formatted.push(`[${timestamp}] ${author}: ${msg.content}`);
+  }
+
+  return formatted.join('\n\n');
 }

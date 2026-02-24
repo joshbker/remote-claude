@@ -1,5 +1,7 @@
 import { spawn } from "child_process";
 import { createInterface } from "readline";
+import fs from "fs";
+import path from "path";
 import { UserState } from "./state";
 
 const TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout
@@ -37,13 +39,14 @@ export async function sendMessage(
   includeRestartContext?: boolean
 ): Promise<ClaudeResponse> {
   const systemPromptParts = [
-    "🤖 You are currently running as the Remote Claude Discord bot.",
-    "The user is messaging you RIGHT NOW through Discord DMs, and you are responding via the Claude Code CLI on their local machine.",
-    "This conversation is happening through the bot architecture described in the codebase you have access to.",
+    "🤖 Your name is Clawde. You are a Discord bot that wraps Claude Code CLI, giving your owner (Josh) remote access to Claude Code from anywhere via Discord DMs.",
+    "Josh is messaging you RIGHT NOW through Discord. You receive his messages, run them through the Claude Code CLI on his local Windows machine, and send responses back to Discord.",
+    "You have full Claude Code capabilities: file editing, bash commands, search, web access, etc. You can read and modify files on Josh's machine.",
+    "You can even modify your own source code (the remote-claude project) and Josh can /restart you to pick up changes.",
     `Working directory: ${state.cwd}`,
-    "You have full Claude Code capabilities: file editing, bash, search, web access, etc.",
-    "Keep responses concise (Discord has a 2000 char per message limit, long responses get split).",
-    "Use markdown and code blocks for formatting.",
+    "Keep responses concise — Discord has a 2000 char per message limit and long responses get split across multiple messages.",
+    "Use markdown and code blocks for formatting. Avoid unnecessary verbosity.",
+    "Users can attach files (images, PDFs, code, etc.) which get downloaded to a temp directory — use the Read tool to view them when paths are provided.",
   ];
 
   if (includeRestartContext) {
@@ -59,7 +62,22 @@ export async function sendMessage(
     );
   }
 
+  if (state.recentCommands && state.recentCommands.length > 0) {
+    systemPromptParts.push(
+      "\n\n⚡ RECENT SLASH COMMANDS: The user ran these commands since the last message:",
+      state.recentCommands.map(cmd => `  ${cmd}`).join("\n")
+    );
+  }
+
   const systemPrompt = systemPromptParts.join(" ");
+
+  // Write system prompt to a temp file to avoid command-line length limits (Windows 8191 char limit)
+  const tempDir = path.join(process.cwd(), ".temp-prompts");
+  if (!fs.existsSync(tempDir)) {
+    fs.mkdirSync(tempDir, { recursive: true });
+  }
+  const systemPromptFile = path.join(tempDir, `system-prompt-${Date.now()}.txt`);
+  fs.writeFileSync(systemPromptFile, systemPrompt);
 
   const args = [
     "-p",
@@ -67,7 +85,7 @@ export async function sendMessage(
     "--verbose",
     "--model", state.model,
     "--permission-mode", state.permissionMode,
-    "--append-system-prompt", systemPrompt,
+    "--append-system-prompt-file", systemPromptFile,
   ];
 
   if (state.hasActiveSession) {
@@ -75,6 +93,7 @@ export async function sendMessage(
   }
 
   console.log(`[claude] model=${state.model}, cwd=${state.cwd}, continue=${state.hasActiveSession}`);
+  console.log(`[claude] System prompt: ${systemPrompt.length} chars (written to file)`);
   console.log(`[claude] Prompt: ${prompt.slice(0, 100)}${prompt.length > 100 ? "..." : ""}`);
 
   // Clean env to avoid nested Claude Code detection
@@ -160,6 +179,8 @@ export async function sendMessage(
       if (code !== 0 && textParts.length === 0) {
         error = error || stderr.trim() || `Claude exited with code ${code}`;
       }
+      // Clean up temp system prompt file
+      try { fs.unlinkSync(systemPromptFile); } catch {}
       finish();
     });
   });

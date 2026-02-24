@@ -34,7 +34,10 @@ export function clearRecalledContext(): void {
 }
 
 export function getRecalledContext(): string | null {
-  return recalledContext; // Keep context until explicitly cleared
+  // One-time injection: --continue preserves context in Clawde's session after first send
+  const ctx = recalledContext;
+  recalledContext = null;
+  return ctx;
 }
 
 export async function injectStartupContext(channel: DMChannel): Promise<void> {
@@ -135,9 +138,9 @@ async function processMessage(
 
   const typing = startTypingIndicator(message.channel);
 
-  // Download images if any
-  const imagePaths: string[] = [];
-  const tempDir = path.join(process.cwd(), ".temp-images");
+  // Download attachments (images, PDFs, text files, code, etc.)
+  const attachmentPaths: string[] = [];
+  const tempDir = path.join(process.cwd(), ".temp-attachments");
 
   try {
     if (attachments.size > 0) {
@@ -147,13 +150,10 @@ async function processMessage(
       }
 
       for (const attachment of attachments.values()) {
-        // Only download images
-        if (attachment.contentType?.startsWith("image/")) {
-          const filename = `${Date.now()}-${attachment.name}`;
-          const filepath = path.join(tempDir, filename);
-          await downloadFile(attachment.url, filepath);
-          imagePaths.push(filepath);
-        }
+        const filename = `${Date.now()}-${attachment.name}`;
+        const filepath = path.join(tempDir, filename);
+        await downloadFile(attachment.url, filepath);
+        attachmentPaths.push(filepath);
       }
     }
 
@@ -254,12 +254,18 @@ async function processMessage(
       }
     };
 
-    // Build the full prompt with image references
-    let fullPrompt = prompt || "What's in this image?";
-    if (imagePaths.length > 0) {
-      // Tell Claude to read the image files
-      const imageList = imagePaths.map((p, i) => `${i + 1}. ${p}`).join("\n");
-      fullPrompt = `The user sent ${imagePaths.length} image${imagePaths.length > 1 ? 's' : ''}. Please use the Read tool to view ${imagePaths.length > 1 ? 'them' : 'it'}:\n${imageList}\n\nUser's message: ${fullPrompt}`;
+    // Build the full prompt with attachment references and command context
+    let fullPrompt = prompt || "What's in this?";
+
+    // Prepend recent slash commands so Claude knows what happened between messages
+    if (state.recentCommands && state.recentCommands.length > 0) {
+      const cmdContext = `[The user ran these slash commands since the last message: ${state.recentCommands.join(", ")}]\n\n`;
+      fullPrompt = cmdContext + fullPrompt;
+    }
+
+    if (attachmentPaths.length > 0) {
+      const fileList = attachmentPaths.map((p, i) => `${i + 1}. ${p}`).join("\n");
+      fullPrompt = `The user sent ${attachmentPaths.length} file${attachmentPaths.length > 1 ? 's' : ''}. Please use the Read tool to view ${attachmentPaths.length > 1 ? 'them' : 'it'}:\n${fileList}\n\nUser's message: ${fullPrompt}`;
     }
 
     // Get recalled context (if any) and pass it to Claude
@@ -269,6 +275,11 @@ async function processMessage(
       justRestarted = false; // Clear flag after first use
     }
     const response = await sendMessage(fullPrompt, state, onStream, context, shouldIncludeRestart);
+
+    // Clear recent commands after they've been injected into context
+    if (state.recentCommands && state.recentCommands.length > 0) {
+      updateState({ recentCommands: [] });
+    }
 
     typing.stop();
 
@@ -315,10 +326,10 @@ async function processMessage(
       await channel.send(`**Error:** ${err.message}`).catch(() => {});
     }
   } finally {
-    // Clean up downloaded images
-    for (const imagePath of imagePaths) {
+    // Clean up downloaded attachments
+    for (const filePath of attachmentPaths) {
       try {
-        fs.unlinkSync(imagePath);
+        fs.unlinkSync(filePath);
       } catch {
         // Ignore cleanup errors
       }

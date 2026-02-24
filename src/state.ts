@@ -9,6 +9,7 @@ export interface UserState {
   showToolUse: boolean;
   permissionMode: string;
   sessionCostUsd: number;
+  recentCommands: string[];
 }
 
 let state: UserState | null = null;
@@ -21,6 +22,7 @@ function getDefaultState(): UserState {
     showToolUse: false,
     permissionMode: config.defaultPermissionMode,
     sessionCostUsd: 0,
+    recentCommands: [],
   };
 }
 

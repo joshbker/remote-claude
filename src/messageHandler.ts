@@ -287,19 +287,20 @@ async function processMessage(
       updateState({ pendingScreenshot: null });
     }
 
-    // Clean up all old files in .temp-attachments (screenshots, user uploads, etc.)
-    try {
-      const tempDir = path.join(state.cwd, ".temp-attachments");
-      if (fs.existsSync(tempDir)) {
-        const files = fs.readdirSync(tempDir);
-        for (const file of files) {
-          try {
-            fs.unlinkSync(path.join(tempDir, file));
-          } catch {}
+    // Clean up all temp files (screenshots, user uploads, system prompts)
+    for (const dir of [".temp-attachments", ".temp-prompts"]) {
+      try {
+        const tempDir = path.join(state.cwd, dir);
+        if (fs.existsSync(tempDir)) {
+          for (const file of fs.readdirSync(tempDir)) {
+            try {
+              fs.unlinkSync(path.join(tempDir, file));
+            } catch {}
+          }
         }
+      } catch (err) {
+        console.error(`[messageHandler] Failed to cleanup ${dir}:`, err);
       }
-    } catch (err) {
-      console.error("[messageHandler] Failed to cleanup temp attachments:", err);
     }
 
     typing.stop();

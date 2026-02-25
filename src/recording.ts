@@ -3,6 +3,73 @@ import path from "path";
 import fs from "fs";
 import { getScreens, getWindows, ScreenInfo, WindowInfo } from "./screenshot";
 
+interface WindowBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** Focus a window and return its screen bounds */
+async function focusAndGetBounds(windowTitle: string): Promise<WindowBounds> {
+  const escapedTitle = windowTitle.replace(/'/g, "''");
+  const psScript = `
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class WinHelper {
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+}
+"@ -ErrorAction SilentlyContinue
+$proc = Get-Process | Where-Object { $_.MainWindowTitle -eq '${escapedTitle}' } | Select-Object -First 1
+if (-not $proc) {
+    $proc = Get-Process | Where-Object { $_.MainWindowTitle -like '*${escapedTitle}*' } | Select-Object -First 1
+}
+if (-not $proc) { throw "Window not found: ${escapedTitle}" }
+$hwnd = $proc.MainWindowHandle
+if ([WinHelper]::IsIconic($hwnd)) {
+    [void][WinHelper]::ShowWindow($hwnd, 9)
+}
+[void][WinHelper]::SetForegroundWindow($hwnd)
+$rect = New-Object WinHelper+RECT
+[void][WinHelper]::GetWindowRect($hwnd, [ref]$rect)
+@{ x=$rect.Left; y=$rect.Top; width=$rect.Right-$rect.Left; height=$rect.Bottom-$rect.Top } | ConvertTo-Json -Compress
+`;
+  return new Promise((resolve, reject) => {
+    const proc = spawn("powershell", ["-ExecutionPolicy", "Bypass", "-Command", psScript], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (d) => (stdout += d.toString()));
+    proc.stderr.on("data", (d) => (stderr += d.toString()));
+    proc.on("close", (code) => {
+      if (code !== 0) return reject(new Error(stderr || "Failed to focus window"));
+      try {
+        resolve(JSON.parse(stdout));
+      } catch {
+        reject(new Error("Failed to parse window bounds"));
+      }
+    });
+    proc.on("error", reject);
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 export interface RecordingOptions {
   duration?: number; // seconds (default 5, max 15)
   monitor?: "primary" | "all" | number;
@@ -93,12 +160,22 @@ async function captureWithFfmpeg(outputPath: string, options: CaptureOptions): P
   const args: string[] = [];
 
   if (windowTitle) {
-    // Window capture via title
+    // Focus window and capture its screen region (avoids overlay issues with gdigrab title=)
+    const bounds = await focusAndGetBounds(windowTitle);
+    await sleep(300); // let window render on top
+
+    // Ensure even dimensions (ffmpeg requires it for some codecs)
+    const w = bounds.width % 2 === 0 ? bounds.width : bounds.width - 1;
+    const h = bounds.height % 2 === 0 ? bounds.height : bounds.height - 1;
+
     args.push(
       "-f", "gdigrab",
       "-framerate", fps.toString(),
+      "-offset_x", bounds.x.toString(),
+      "-offset_y", bounds.y.toString(),
+      "-video_size", `${w}x${h}`,
       "-t", duration.toString(),
-      "-i", `title=${windowTitle}`,
+      "-i", "desktop",
     );
   } else {
     // Screen capture - need to determine bounds for specific monitors
@@ -194,12 +271,14 @@ export async function parseRecordTarget(target: string | null): Promise<Partial<
     return { monitor: parseInt(monMatch[1]) };
   }
 
-  // Window match
+  // Window match — check both directions (target in title, and title in target)
   const windows = await getWindows();
   const match = windows.find(
     (w) =>
       w.processName.toLowerCase().includes(lower) ||
-      w.title.toLowerCase().includes(lower)
+      w.title.toLowerCase().includes(lower) ||
+      lower.includes(w.processName.toLowerCase()) ||
+      lower.includes(w.title.toLowerCase())
   );
 
   if (match) {

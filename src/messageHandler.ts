@@ -284,14 +284,22 @@ async function processMessage(
 
     // Clean up pending screenshot after Claude has seen it
     if (state.pendingScreenshot) {
-      try {
-        if (fs.existsSync(state.pendingScreenshot)) {
-          fs.unlinkSync(state.pendingScreenshot);
-        }
-      } catch (err) {
-        console.error("[messageHandler] Failed to cleanup screenshot:", err);
-      }
       updateState({ pendingScreenshot: null });
+    }
+
+    // Clean up all old files in .temp-attachments (screenshots, user uploads, etc.)
+    try {
+      const tempDir = path.join(state.cwd, ".temp-attachments");
+      if (fs.existsSync(tempDir)) {
+        const files = fs.readdirSync(tempDir);
+        for (const file of files) {
+          try {
+            fs.unlinkSync(path.join(tempDir, file));
+          } catch {}
+        }
+      }
+    } catch (err) {
+      console.error("[messageHandler] Failed to cleanup temp attachments:", err);
     }
 
     typing.stop();

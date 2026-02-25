@@ -10,11 +10,21 @@ import {
   Message,
   DMChannel,
   Collection,
+  AutocompleteInteraction,
 } from "discord.js";
 import { config } from "./config";
 import { getState, updateState } from "./state";
 import { cancelCurrentRequest } from "./claude";
 import { setRecalledContext, clearRecalledContext } from "./messageHandler";
+import {
+  takeScreenshot,
+  getScreens,
+  getWindows,
+  formatScreenInfo,
+  formatWindowInfo,
+  ScreenshotOptions,
+} from "./screenshot";
+import { recordScreen, parseRecordTarget } from "./recording";
 
 const commands = [
   new SlashCommandBuilder()
@@ -122,11 +132,101 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
+    .setName("todo")
+    .setDescription("View Claude's current todo list"),
+
+  new SlashCommandBuilder()
+    .setName("screenshot")
+    .setDescription("Take a screenshot and send it")
+    .addStringOption((opt) =>
+      opt
+        .setName("target")
+        .setDescription("What to capture: primary (default), all, monitor number, or app name")
+        .setAutocomplete(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("record")
+    .setDescription("Record a short screen capture GIF/MP4")
+    .addIntegerOption((opt) =>
+      opt
+        .setName("duration")
+        .setDescription("Recording duration in seconds (default: 5, max: 15)")
+        .setMinValue(1)
+        .setMaxValue(15)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName("target")
+        .setDescription("What to capture: primary (default), all, monitor number, or app name")
+        .setAutocomplete(true)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName("format")
+        .setDescription("Output format")
+        .addChoices(
+          { name: "GIF", value: "gif" },
+          { name: "MP4", value: "mp4" }
+        )
+    ),
+
+  new SlashCommandBuilder()
+    .setName("open")
+    .setDescription("Open a URL, app, or file")
+    .addStringOption((opt) =>
+      opt
+        .setName("target")
+        .setDescription("URL, app name, or file path to open")
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("focus")
+    .setDescription("Bring a window to the foreground")
+    .addStringOption((opt) =>
+      opt
+        .setName("app")
+        .setDescription("App/window name to focus")
+        .setRequired(true)
+        .setAutocomplete(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("key")
+    .setDescription("Send keystrokes to the active window")
+    .addStringOption((opt) =>
+      opt
+        .setName("keys")
+        .setDescription("Keys to send (e.g. \"ctrl+s\", \"alt+tab\", \"ctrl+shift+esc\")")
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("type")
+    .setDescription("Type text into the active window")
+    .addStringOption((opt) =>
+      opt
+        .setName("text")
+        .setDescription("Text to type (press Enter at end with enter=true)")
+        .setRequired(true)
+    )
+    .addBooleanOption((opt) =>
+      opt
+        .setName("enter")
+        .setDescription("Press Enter after typing (default: true)")
+    ),
+
+  new SlashCommandBuilder()
+    .setName("screens")
+    .setDescription("List available monitors and open windows"),
+
+  new SlashCommandBuilder()
     .setName("help")
     .setDescription("Show all available commands"),
 ];
 
-function trackCommand(commandName: string, args?: Record<string, any>): void {
+function trackCommand(commandName: string, args?: Record<string, any>, screenshotPath?: string): void {
   const state = getState();
   const argStr = args && Object.keys(args).length > 0
     ? " " + Object.entries(args).map(([k, v]) => `${k}="${v}"`).join(" ")
@@ -135,7 +235,7 @@ function trackCommand(commandName: string, args?: Record<string, any>): void {
 
   // Keep last 10 commands
   const recentCommands = [...state.recentCommands, commandStr].slice(-10);
-  updateState({ recentCommands });
+  updateState({ recentCommands, pendingScreenshot: screenshotPath || null });
 }
 
 export async function registerCommands(): Promise<void> {
@@ -190,7 +290,7 @@ export async function handleCommand(
 
     case "clear": {
       trackCommand("clear");
-      updateState({ hasActiveSession: false, sessionCostUsd: 0 });
+      updateState({ hasActiveSession: false, sessionCostUsd: 0, todos: [] });
       clearRecalledContext();
       await interaction.reply("Conversation cleared. Next message starts fresh.");
       break;
@@ -245,12 +345,42 @@ export async function handleCommand(
     }
 
     case "restart": {
-      trackCommand("restart");
       cancelCurrentRequest();
-      await interaction.reply("🔄 Restarting bot...");
-      // Give Discord time to send the reply, then exit.
-      // The wrapper (restart.ts) will auto-restart the process.
-      setTimeout(() => process.exit(0), 1000);
+      await interaction.deferReply();
+
+      // Type check BEFORE exiting - if we fail, we stay alive
+      try {
+        const { execSync } = require("child_process");
+        await interaction.editReply("🔄 Checking code before restart...");
+        execSync("npx tsc --noEmit", { stdio: "pipe", cwd: process.cwd() });
+        // Type check passed - safe to restart
+        trackCommand("restart");
+        await interaction.editReply("✅ Type check passed. Restarting bot...");
+        setTimeout(() => process.exit(0), 500);
+      } catch (err: any) {
+        const error = err.stderr?.toString() || err.stdout?.toString() || err.message;
+        // Extract just the error lines (skip the generic tsc noise)
+        const lines = error.split("\n").filter((l: string) =>
+          l.toLowerCase().includes("error") && (l.includes(".ts(") || l.includes(".ts:"))
+        ).slice(0, 5); // First 5 errors max
+
+        const errorMsg = lines.length > 0
+          ? "```\n" + lines.join("\n") + "\n```"
+          : "```Type check failed```";
+
+        // Track the failed restart in recentCommands so the current (still running) session knows about it
+        trackCommand("restart");
+        const state = getState();
+        const recentCommands = [
+          ...state.recentCommands,
+          `restart (FAILED: ${lines.length} type error${lines.length > 1 ? 's' : ''})\n${lines.join("\n")}`
+        ];
+        updateState({ recentCommands: recentCommands.slice(-10) });
+
+        await interaction.editReply(
+          `❌ Type check failed - not restarting!\n\n${errorMsg}\n\nI can see these errors. Want me to fix them?`
+        );
+      }
       break;
     }
 
@@ -350,9 +480,394 @@ export async function handleCommand(
       break;
     }
 
+    case "todo": {
+      trackCommand("todo");
+      const todos = state.todos || [];
+
+      if (todos.length === 0) {
+        await interaction.reply("📋 No active todo list. Claude will create one when working on multi-step tasks.");
+        break;
+      }
+
+      const statusIcons: Record<string, string> = {
+        completed: "✅",
+        in_progress: "🔄",
+        pending: "⬜",
+      };
+
+      const completed = todos.filter((t: any) => t.status === "completed").length;
+      const inProgress = todos.find((t: any) => t.status === "in_progress");
+      const total = todos.length;
+
+      const lines = [
+        `**📋 Todo List** (${completed}/${total} done)`,
+        "",
+        ...todos.map((t: any, i: number) => {
+          const icon = statusIcons[t.status] || "⬜";
+          return `${icon} ${t.content}`;
+        }),
+      ];
+
+      if (inProgress) {
+        lines.push("", `-# Currently: ${inProgress.activeForm}`);
+      }
+
+      await interaction.reply(lines.join("\n"));
+      break;
+    }
+
+    case "screenshot": {
+      const target = interaction.options.getString("target");
+
+      await interaction.deferReply();
+
+      try {
+        // Determine screenshot options
+        let options: ScreenshotOptions = { monitor: "primary" };
+
+        if (target) {
+          const lower = target.toLowerCase();
+
+          // Check for "all"
+          if (lower === "all") {
+            options = { monitor: "all" };
+          }
+          // Check for monitor number (handle 1-indexed from autocomplete)
+          else if (/^monitor (\d+)|^(\d+)$/.test(target)) {
+            const match = target.match(/(\d+)/);
+            if (match) {
+              options = { monitor: parseInt(match[1]) };
+            }
+          }
+          // Check for app name
+          else {
+            const windows = await getWindows();
+            const match = windows.find((w) =>
+              w.processName.toLowerCase().includes(lower) ||
+              w.title.toLowerCase().includes(lower)
+            );
+            if (match) {
+              options = { windowId: match.id };
+            } else {
+              await interaction.editReply(`❌ No window found matching "${target}". Use \`/screens\` to see options.`);
+              break;
+            }
+          }
+        }
+
+        // Take the screenshot
+        const filePath = await takeScreenshot(options);
+
+        // Send the image
+        const targetDesc = options.windowId
+          ? "window"
+          : options.monitor === "all"
+          ? "all monitors"
+          : options.monitor === "primary"
+          ? "primary monitor"
+          : `monitor ${options.monitor}`;
+
+        await interaction.editReply({
+          content: `📸 Screenshot of ${targetDesc}:`,
+          files: [filePath],
+        });
+
+        // Copy to temp-attachments so Claude can see it
+        const tempDir = path.join(process.cwd(), ".temp-attachments");
+        if (!fs.existsSync(tempDir)) {
+          fs.mkdirSync(tempDir, { recursive: true });
+        }
+        const tempPath = path.join(tempDir, `screenshot-${Date.now()}.png`);
+        fs.copyFileSync(filePath, tempPath);
+
+        // Track command with screenshot path (gets injected into next message's context)
+        trackCommand("screenshot", { target: targetDesc }, tempPath);
+
+        // Clean up the original temp file
+        fs.unlinkSync(filePath);
+      } catch (err: any) {
+        await interaction.editReply(`❌ Error: ${err.message}`);
+      }
+      break;
+    }
+
+    case "record": {
+      const duration = interaction.options.getInteger("duration") || 5;
+      const target = interaction.options.getString("target");
+      const format = (interaction.options.getString("format") || "gif") as "gif" | "mp4";
+
+      await interaction.deferReply();
+
+      try {
+        const targetOpts = await parseRecordTarget(target);
+        const targetDesc = targetOpts.windowTitle
+          ? `"${targetOpts.windowTitle.slice(0, 30)}"`
+          : targetOpts.monitor === "all"
+          ? "all monitors"
+          : targetOpts.monitor === "primary"
+          ? "primary monitor"
+          : `monitor ${targetOpts.monitor}`;
+
+        await interaction.editReply(`🔴 Recording ${targetDesc} for ${duration}s...`);
+
+        const filePath = await recordScreen({
+          duration,
+          format,
+          ...targetOpts,
+        });
+
+        // Check file size (Discord limit ~25MB)
+        const stats = fs.statSync(filePath);
+        const sizeMB = stats.size / (1024 * 1024);
+
+        if (sizeMB > 25) {
+          fs.unlinkSync(filePath);
+          await interaction.editReply(
+            `❌ Recording too large (${sizeMB.toFixed(1)}MB). Try shorter duration or smaller target.`
+          );
+          break;
+        }
+
+        trackCommand("record", { duration, target: targetDesc, format });
+        await interaction.editReply({
+          content: `🎬 ${format.toUpperCase()} recording of ${targetDesc} (${duration}s, ${sizeMB.toFixed(1)}MB):`,
+          files: [filePath],
+        });
+
+        // Clean up
+        setTimeout(() => {
+          if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        }, 5000);
+      } catch (err: any) {
+        const msg = err.message.includes("ffmpeg not found")
+          ? "❌ ffmpeg not found. Install it and make sure it's in PATH."
+          : `❌ Recording failed: ${err.message.slice(0, 200)}`;
+        await interaction.editReply(msg);
+      }
+      break;
+    }
+
+    case "open": {
+      const target = interaction.options.getString("target", true);
+      await interaction.deferReply();
+
+      try {
+        // Use PowerShell Start-Process which handles URLs, apps, and files
+        const result = await new Promise<string>((resolve, reject) => {
+          // For URLs, use Start-Process directly
+          // For app names, try Start-Process first (works for things in PATH and Start Menu)
+          const isUrl = /^https?:\/\//i.test(target);
+          const psCommand = isUrl
+            ? `Start-Process "${target}"`
+            : `Start-Process "${target}"`;
+
+          const proc = spawn("powershell", [
+            "-ExecutionPolicy", "Bypass",
+            "-Command", psCommand,
+          ]);
+
+          let stderr = "";
+          proc.stderr.on("data", (d) => (stderr += d.toString()));
+          proc.on("close", (code) => {
+            if (code === 0) resolve("ok");
+            else reject(new Error(stderr || `Exit code ${code}`));
+          });
+          proc.on("error", reject);
+        });
+
+        trackCommand("open", { target });
+        const icon = /^https?:\/\//i.test(target) ? "🌐" : "🚀";
+        await interaction.editReply(`${icon} Opened: ${target}`);
+      } catch (err: any) {
+        await interaction.editReply(`❌ Failed to open "${target}": ${err.message.slice(0, 200)}`);
+      }
+      break;
+    }
+
+    case "focus": {
+      const app = interaction.options.getString("app", true);
+      await interaction.deferReply();
+
+      try {
+        const windows = await getWindows();
+        const lower = app.toLowerCase();
+        const match = windows.find(
+          (w) =>
+            w.processName.toLowerCase().includes(lower) ||
+            w.title.toLowerCase().includes(lower)
+        );
+
+        if (!match) {
+          await interaction.editReply(`❌ No window found matching "${app}". Use \`/screens\` to see open windows.`);
+          break;
+        }
+
+        // Use PowerShell to bring window to foreground
+        await new Promise<void>((resolve, reject) => {
+          const psScript = `
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class FocusHelper {
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
+}
+"@
+$proc = Get-Process -Id ${match.id} -ErrorAction Stop
+$hwnd = $proc.MainWindowHandle
+if ([FocusHelper]::IsIconic($hwnd)) {
+    [FocusHelper]::ShowWindow($hwnd, 9)
+}
+[FocusHelper]::SetForegroundWindow($hwnd)
+`;
+          const proc = spawn("powershell", [
+            "-ExecutionPolicy", "Bypass",
+            "-Command", psScript,
+          ]);
+
+          let stderr = "";
+          proc.stderr.on("data", (d) => (stderr += d.toString()));
+          proc.on("close", (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(stderr || `Exit code ${code}`));
+          });
+          proc.on("error", reject);
+        });
+
+        trackCommand("focus", { app: match.processName });
+        const title = match.title.length > 40 ? match.title.slice(0, 40) + "..." : match.title;
+        await interaction.editReply(`🎯 Focused: **${match.processName}** (${title})`);
+      } catch (err: any) {
+        await interaction.editReply(`❌ Failed to focus: ${err.message.slice(0, 200)}`);
+      }
+      break;
+    }
+
+    case "key": {
+      const keys = interaction.options.getString("keys", true);
+      await interaction.deferReply();
+
+      try {
+        // Parse key combo like "ctrl+shift+s" into SendKeys format
+        const sendKeysStr = parseKeysToSendKeys(keys);
+
+        await new Promise<void>((resolve, reject) => {
+          // Use C# SendKeys via PowerShell for reliability
+          const psScript = `
+Add-Type -AssemblyName System.Windows.Forms
+Start-Sleep -Milliseconds 100
+[System.Windows.Forms.SendKeys]::SendWait("${sendKeysStr}")
+`;
+          const proc = spawn("powershell", [
+            "-ExecutionPolicy", "Bypass",
+            "-Command", psScript,
+          ]);
+
+          let stderr = "";
+          proc.stderr.on("data", (d) => (stderr += d.toString()));
+          proc.on("close", (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(stderr || `Exit code ${code}`));
+          });
+          proc.on("error", reject);
+        });
+
+        trackCommand("key", { keys });
+        await interaction.editReply(`⌨️ Sent: \`${keys}\``);
+      } catch (err: any) {
+        await interaction.editReply(`❌ Failed to send keys: ${err.message.slice(0, 200)}`);
+      }
+      break;
+    }
+
+    case "type": {
+      const text = interaction.options.getString("text", true);
+      const pressEnter = interaction.options.getBoolean("enter") ?? true;
+      await interaction.deferReply();
+
+      try {
+        // Normalize smart quotes and other unicode punctuation to ASCII
+        const normalized = text
+          .replace(/[\u201C\u201D\u201E\u201F\u2033\u2036]/g, '"')  // smart double quotes
+          .replace(/[\u2018\u2019\u201A\u201B\u2032\u2035]/g, "'")  // smart single quotes
+          .replace(/[\u2013\u2014]/g, "-")  // en/em dash
+          .replace(/\u2026/g, "...");  // ellipsis
+
+        // Escape special SendKeys characters: +^%~(){}[]
+        const escaped = normalized.replace(/([+^%~(){}[\]])/g, "{$1}");
+        const sendKeysStr = pressEnter ? `${escaped}{ENTER}` : escaped;
+
+        // Write to temp file to avoid all shell escaping issues
+        const tempFile = path.join(os.tmpdir(), `sendkeys-${Date.now()}.txt`);
+        fs.writeFileSync(tempFile, sendKeysStr, "ascii");
+
+        await new Promise<void>((resolve, reject) => {
+          const psScript = `
+Add-Type -AssemblyName System.Windows.Forms
+Start-Sleep -Milliseconds 100
+$keys = Get-Content -Path '${tempFile.replace(/\\/g, "\\\\")}' -Raw -Encoding ASCII
+[System.Windows.Forms.SendKeys]::SendWait($keys)
+Remove-Item -Path '${tempFile.replace(/\\/g, "\\\\")}' -ErrorAction SilentlyContinue
+`;
+          const proc = spawn("powershell", [
+            "-ExecutionPolicy", "Bypass",
+            "-Command", psScript,
+          ]);
+
+          let stderr = "";
+          proc.stderr.on("data", (d) => (stderr += d.toString()));
+          proc.on("close", (code) => {
+            // Clean up just in case PS didn't
+            if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+            if (code === 0) resolve();
+            else reject(new Error(stderr || `Exit code ${code}`));
+          });
+          proc.on("error", reject);
+        });
+
+        trackCommand("type", { text: text.slice(0, 50) });
+        const preview = text.length > 50 ? text.slice(0, 50) + "..." : text;
+        const enterNote = pressEnter ? " + Enter" : "";
+        await interaction.editReply(`⌨️ Typed: \`${preview}\`${enterNote}`);
+      } catch (err: any) {
+        await interaction.editReply(`❌ Failed to type: ${err.message.slice(0, 200)}`);
+      }
+      break;
+    }
+
+    case "screens": {
+      trackCommand("screens");
+      await interaction.deferReply();
+
+      try {
+        const [screens, windows] = await Promise.all([getScreens(), getWindows()]);
+        const lines = [
+          "**🖥️ Available Monitors:**",
+          "```",
+          formatScreenInfo(screens),
+          "```",
+          "",
+          "**📱 Open Windows:**",
+          "```",
+          formatWindowInfo(windows),
+          "```",
+          "",
+          `-# Use \`/screenshot\` with autocomplete to capture`,
+        ];
+        await interaction.editReply(lines.join("\n"));
+      } catch (err: any) {
+        await interaction.editReply(`❌ Error: ${err.message}`);
+      }
+      break;
+    }
+
     case "help": {
       const helpText = [
-        "**📋 Remote Claude Bot Commands**",
+        `**📋 ${config.botName} Commands**`,
         "",
         "**💬 Conversation**",
         "`/clear` — Start fresh conversation",
@@ -371,6 +886,14 @@ export async function handleCommand(
         "`/forget [number]` — Remove a memory",
         "",
         "**🔧 System**",
+        "`/screenshot [target]` — Take and send a screenshot",
+        "`/record [duration] [target] [format]` — Record screen as GIF/MP4",
+        "`/open [target]` — Open a URL, app, or file",
+        "`/focus [app]` — Bring a window to the foreground",
+        "`/key [keys]` — Send keystrokes (e.g. `ctrl+s`, `alt+tab`)",
+        "`/type [text]` — Type text into the active window",
+        "`/screens` — List available monitors and windows",
+        "`/todo` — View Claude's current task list",
         "`/restart` — Restart bot (picks up code changes)",
         "`/help` — This message",
         "",
@@ -581,5 +1104,163 @@ async function forgetClaudeMemory(
     return { success: true };
   } catch (err: any) {
     return { success: false, error: err.message };
+  }
+}
+
+// Convert human-readable key combos like "ctrl+shift+s" to SendKeys format
+// See: https://learn.microsoft.com/en-us/dotnet/api/system.windows.forms.sendkeys
+function parseKeysToSendKeys(input: string): string {
+  const modifierMap: Record<string, string> = {
+    ctrl: "^",
+    control: "^",
+    alt: "%",
+    shift: "+",
+    win: "^({ESC})", // No direct SendKeys for Win, but Ctrl+Esc opens Start
+  };
+
+  const keyMap: Record<string, string> = {
+    enter: "{ENTER}",
+    return: "{ENTER}",
+    tab: "{TAB}",
+    escape: "{ESC}",
+    esc: "{ESC}",
+    space: " ",
+    backspace: "{BS}",
+    delete: "{DEL}",
+    del: "{DEL}",
+    insert: "{INS}",
+    ins: "{INS}",
+    home: "{HOME}",
+    end: "{END}",
+    pageup: "{PGUP}",
+    pgup: "{PGUP}",
+    pagedown: "{PGDN}",
+    pgdn: "{PGDN}",
+    up: "{UP}",
+    down: "{DOWN}",
+    left: "{LEFT}",
+    right: "{RIGHT}",
+    f1: "{F1}", f2: "{F2}", f3: "{F3}", f4: "{F4}",
+    f5: "{F5}", f6: "{F6}", f7: "{F7}", f8: "{F8}",
+    f9: "{F9}", f10: "{F10}", f11: "{F11}", f12: "{F12}",
+    capslock: "{CAPSLOCK}",
+    numlock: "{NUMLOCK}",
+    scrolllock: "{SCROLLLOCK}",
+    printscreen: "{PRTSC}",
+    prtsc: "{PRTSC}",
+  };
+
+  // Handle multiple key sequences separated by spaces (e.g. "ctrl+a ctrl+c")
+  const sequences = input.trim().split(/\s+/);
+  const results: string[] = [];
+
+  for (const seq of sequences) {
+    const parts = seq.toLowerCase().split("+");
+    let modifiers = "";
+    let key = "";
+
+    for (const part of parts) {
+      if (modifierMap[part]) {
+        modifiers += modifierMap[part];
+      } else if (keyMap[part]) {
+        key = keyMap[part];
+      } else if (part.length === 1) {
+        key = part;
+      } else {
+        // Unknown key, try as literal
+        key = part;
+      }
+    }
+
+    if (modifiers && key) {
+      results.push(`${modifiers}(${key})`);
+    } else if (key) {
+      results.push(key);
+    } else if (modifiers) {
+      results.push(modifiers);
+    }
+  }
+
+  return results.join("");
+}
+
+export async function handleAutocomplete(
+  interaction: AutocompleteInteraction
+): Promise<void> {
+  // Owner only
+  if (interaction.user.id !== config.ownerId) {
+    return;
+  }
+
+  if (interaction.commandName === "focus") {
+    // Focus only shows windows, not monitors
+    const focusedValue = interaction.options.getFocused();
+    const lower = focusedValue.toLowerCase();
+    try {
+      const windows = await getWindows();
+      const choices: { name: string; value: string }[] = [];
+      for (const win of windows) {
+        if (lower === "" || win.processName.toLowerCase().includes(lower) || win.title.toLowerCase().includes(lower)) {
+          const title = win.title.length > 30 ? win.title.slice(0, 30) + "..." : win.title;
+          choices.push({ name: `${win.processName}: ${title}`, value: win.processName });
+          if (choices.length >= 25) break;
+        }
+      }
+      await interaction.respond(choices.slice(0, 25));
+    } catch (err) {
+      console.error("Focus autocomplete error:", err);
+    }
+    return;
+  }
+
+  if (interaction.commandName !== "screenshot" && interaction.commandName !== "record") return;
+
+  const focusedValue = interaction.options.getFocused();
+  const lower = focusedValue.toLowerCase();
+
+  try {
+    const choices: { name: string; value: string }[] = [];
+
+    // Add static options
+    choices.push({ name: "Primary monitor", value: "primary" });
+    choices.push({ name: "All monitors", value: "all" });
+
+    // Add monitors
+    const screens = await getScreens();
+    for (const screen of screens) {
+      const label = screen.primary
+        ? `Monitor ${screen.index + 1} (${screen.width}x${screen.height}, primary)`
+        : `Monitor ${screen.index + 1} (${screen.width}x${screen.height})`;
+      choices.push({ name: label, value: (screen.index).toString() });
+    }
+
+    // Add windows (filter by focused value)
+    const windows = await getWindows();
+    for (const win of windows) {
+      const processLower = win.processName.toLowerCase();
+      const titleLower = win.title.toLowerCase();
+
+      // Only show windows that match the focused value
+      if (lower === "" || processLower.includes(lower) || titleLower.includes(lower)) {
+        // Truncate long titles
+        const title = win.title.length > 30 ? win.title.slice(0, 30) + "..." : win.title;
+        choices.push({
+          name: `${win.processName}: ${title}`,
+          value: win.processName,
+        });
+
+        // Limit to 25 choices total (Discord max)
+        if (choices.length >= 24) break;
+      }
+    }
+
+    // Filter choices by focused value for static options too
+    const filtered = lower
+      ? choices.filter((c) => c.name.toLowerCase().includes(lower))
+      : choices;
+
+    await interaction.respond(filtered.slice(0, 25));
+  } catch (err) {
+    console.error("Autocomplete error:", err);
   }
 }

@@ -14,6 +14,7 @@ import { config } from "./config";
 import { getState, updateState } from "./state";
 import { sendMessage, cancelCurrentRequest, StreamEvent } from "./claude";
 import { splitMessage, startTypingIndicator } from "./discord";
+// No screenshot imports — use /screenshot command instead
 import fs from "fs";
 import path from "path";
 import https from "https";
@@ -279,6 +280,18 @@ async function processMessage(
     // Clear recent commands after they've been injected into context
     if (state.recentCommands && state.recentCommands.length > 0) {
       updateState({ recentCommands: [] });
+    }
+
+    // Clean up pending screenshot after Claude has seen it
+    if (state.pendingScreenshot) {
+      try {
+        if (fs.existsSync(state.pendingScreenshot)) {
+          fs.unlinkSync(state.pendingScreenshot);
+        }
+      } catch (err) {
+        console.error("[messageHandler] Failed to cleanup screenshot:", err);
+      }
+      updateState({ pendingScreenshot: null });
     }
 
     typing.stop();

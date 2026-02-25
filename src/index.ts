@@ -37,6 +37,17 @@ client.once(Events.ClientReady, async (c) => {
 client.on(Events.MessageCreate, handleDirectMessage);
 
 client.on(Events.InteractionCreate, async (interaction) => {
+  // Handle autocomplete
+  if (interaction.type === InteractionType.ApplicationCommandAutocomplete) {
+    try {
+      const { handleAutocomplete } = await import("./commands");
+      await handleAutocomplete(interaction as any);
+    } catch (err) {
+      console.error("Autocomplete error:", err);
+    }
+    return;
+  }
+
   if (interaction.type !== InteractionType.ApplicationCommand) return;
   if (!interaction.isChatInputCommand()) return;
   try {

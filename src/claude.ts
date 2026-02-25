@@ -2,13 +2,16 @@ import { spawn } from "child_process";
 import { createInterface } from "readline";
 import fs from "fs";
 import path from "path";
-import { UserState } from "./state";
+import { UserState, updateState } from "./state";
 import { config } from "./config";
 
 const TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout
 
 // Track the active process so it can be killed externally
 let activeProc: ReturnType<typeof spawn> | null = null;
+
+// Track todo list state for first-creation detection
+let lastTodoCount = 0;
 
 export function cancelCurrentRequest(): boolean {
   if (activeProc) {
@@ -67,6 +70,13 @@ export async function sendMessage(
     );
   }
 
+  if (state.pendingScreenshot) {
+    systemPromptParts.push(
+      `\n\n📸 SCREENSHOT: The user ran /screenshot. The image is saved at: ${state.pendingScreenshot}`,
+      "Use the Read tool to view and analyze it. The file will be cleaned up after you read it."
+    );
+  }
+
   const systemPrompt = systemPromptParts.join(" ");
 
   // Write system prompt to a temp file to avoid command-line length limits (Windows 8191 char limit)
@@ -88,6 +98,8 @@ export async function sendMessage(
 
   if (state.hasActiveSession) {
     args.push("--continue");
+  } else {
+    lastTodoCount = 0; // Reset on new session
   }
 
   console.log(`[claude] model=${state.model}, cwd=${state.cwd}, continue=${state.hasActiveSession}`);
@@ -208,6 +220,10 @@ function handleMessage(
             textParts.push(block.text);
             onStream?.({ type: "text", content: block.text });
           } else if (block.type === "tool_use") {
+            // Persist TodoWrite data to state so /todo can display it
+            if (block.name === "TodoWrite" && block.input?.todos) {
+              updateState({ todos: block.input.todos });
+            }
             if (state.showToolUse) {
               const formatted = formatToolUse(block.name, block.input);
               toolUseParts.push(formatted);
@@ -287,11 +303,16 @@ function formatToolUse(toolName: string, input: any): string {
       const todos = input?.todos || [];
       const inProgress = todos.find((t: any) => t.status === "in_progress");
       const completed = todos.filter((t: any) => t.status === "completed").length;
-      const pending = todos.filter((t: any) => t.status === "pending").length;
       const total = todos.length;
+      const isNew = !lastTodoCount;
+      lastTodoCount = total;
 
+      if (isNew) {
+        const taskList = todos.map((t: any) => t.content).join(", ");
+        return `-# ${icon} Created todo list (${total} items): ${taskList}`;
+      }
       if (inProgress) {
-        return `-# ${icon} ${inProgress.activeForm} (${completed}/${total} done, ${pending} pending)`;
+        return `-# ${icon} ${inProgress.activeForm} (${completed}/${total} done)`;
       }
       return `-# ${icon} Updated todos: ${completed}/${total} done`;
     }

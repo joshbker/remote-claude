@@ -2,6 +2,12 @@ import fs from "fs";
 import path from "path";
 import { config } from "./config";
 
+export interface TodoItem {
+  content: string;
+  status: "pending" | "in_progress" | "completed";
+  activeForm: string;
+}
+
 export interface UserState {
   cwd: string;
   model: string;
@@ -10,6 +16,8 @@ export interface UserState {
   permissionMode: string;
   sessionCostUsd: number;
   recentCommands: string[];
+  todos: TodoItem[];
+  pendingScreenshot: string | null;
 }
 
 let state: UserState | null = null;
@@ -23,6 +31,8 @@ function getDefaultState(): UserState {
     permissionMode: config.defaultPermissionMode,
     sessionCostUsd: 0,
     recentCommands: [],
+    todos: [],
+    pendingScreenshot: null,
   };
 }
 

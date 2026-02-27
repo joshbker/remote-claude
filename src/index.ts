@@ -24,7 +24,7 @@ client.once(Events.ClientReady, async (c) => {
 
     // Send startup notification to owner
     const owner = await c.users.fetch(config.ownerId);
-    await owner.send("✅ Bot online and ready!");
+    await owner.send("✅ I'm back up and running!");
 
     // Inject startup context into Claude's session (without sending response to Discord)
     const dmChannel = await owner.createDM();

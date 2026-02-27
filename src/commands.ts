@@ -87,7 +87,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("restart")
-    .setDescription("Restart the bot (picks up code changes)"),
+    .setDescription("Restart (picks up code changes)"),
 
   new SlashCommandBuilder()
     .setName("remember")
@@ -355,7 +355,7 @@ export async function handleCommand(
         execSync("npx tsc --noEmit", { stdio: "pipe", cwd: process.cwd() });
         // Type check passed - safe to restart
         trackCommand("restart");
-        await interaction.editReply("✅ Type check passed. Restarting bot...");
+        await interaction.editReply("✅ Type check passed. Restarting...");
         setTimeout(() => process.exit(0), 500);
       } catch (err: any) {
         const error = err.stderr?.toString() || err.stdout?.toString() || err.message;

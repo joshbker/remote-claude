@@ -4,3 +4,5 @@ data/
 .env
 .temp-attachments/
 .temp-prompts/
+logs/
+nul

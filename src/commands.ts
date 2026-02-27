@@ -1005,8 +1005,8 @@ async function fetchMessageHistory(
   const formatted: string[] = [];
 
   for (const msg of relevant) {
-    const author = msg.author.bot ? "Assistant" : "User";
-    const timestamp = msg.createdAt.toISOString().split('T')[0]; // Just the date
+    const author = msg.author.bot ? config.botName : config.ownerName;
+    const timestamp = msg.createdAt.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
     formatted.push(`[${timestamp}] ${author}: ${msg.content}`);
   }
 
